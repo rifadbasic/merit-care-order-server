@@ -360,7 +360,9 @@ app.post("/api/orders", async (req, res) => {
       0,
     );
 
-    const delivery = String(customer.district).trim() === "ঢাকা" ? 80 : 120;
+    // Delivery Charge
+    const delivery =
+      String(customer.district).trim() === "ঢাকা সিটি" ? 80 : 120;
 
     const total = subtotal + delivery;
 
