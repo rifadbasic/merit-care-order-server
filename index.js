@@ -298,9 +298,13 @@ app.post("/api/telegram/webhook", async (req, res) => {
 
 app.post("/api/orders", async (req, res) => {
   try {
-    const { customer, products: cartProducts } = req.body;
+    const { customer, products: cartProducts, advancePayment } = req.body;
 
-    // Customer validation
+    console.log("📦 Incoming Order:", req.body);
+
+    // ===============================
+    // CUSTOMER VALIDATION
+    // ===============================
     if (
       !customer ||
       !customer.name ||
@@ -308,7 +312,8 @@ app.post("/api/orders", async (req, res) => {
       !customer.division ||
       !customer.district ||
       !customer.upazila ||
-      !customer.address
+      !customer.address ||
+      !customer.payment
     ) {
       return res.status(400).json({
         success: false,
@@ -325,6 +330,9 @@ app.post("/api/orders", async (req, res) => {
       });
     }
 
+    // ===============================
+    // PRODUCTS VALIDATION
+    // ===============================
     if (!Array.isArray(cartProducts) || cartProducts.length === 0) {
       return res.status(400).json({
         success: false,
@@ -332,7 +340,6 @@ app.post("/api/orders", async (req, res) => {
       });
     }
 
-    // Validate products and quantities
     const verifiedProducts = cartProducts.map((item) => {
       const product = products.find((p) => p.id === Number(item.id));
 
@@ -355,44 +362,139 @@ app.post("/api/orders", async (req, res) => {
       };
     });
 
+    // ===============================
+    // CALCULATE ORDER TOTAL
+    // ===============================
     const subtotal = verifiedProducts.reduce(
       (sum, item) => sum + item.price * item.quantity,
       0,
     );
 
-    // Delivery Charge
     const delivery =
       String(customer.district).trim() === "ঢাকা সিটি" ? 80 : 120;
 
     const total = subtotal + delivery;
 
+    // ===============================
+    // ADVANCE PAYMENT VALIDATION
+    // ===============================
+    if (customer.payment === "Advance") {
+      if (
+        !advancePayment ||
+        !["Nagad", "Bank"].includes(advancePayment.method)
+      ) {
+        throw new Error("Invalid advance payment method");
+      }
+
+      const amount = Number(advancePayment.amount);
+
+      // Validate advance amount
+      if (!Number.isInteger(amount) || amount <= 0 || amount > total) {
+        throw new Error("Invalid advance payment amount");
+      }
+
+      // Nagad validation
+      if (advancePayment.method === "Nagad") {
+        const transactionId = String(advancePayment.transactionId || "")
+          .trim()
+          .toUpperCase();
+
+        const senderNumber = String(advancePayment.senderNumber || "").trim();
+
+        // Transaction ID must be exactly 8 alphanumeric characters
+        if (!/^[A-Z0-9]{8}$/.test(transactionId)) {
+          throw new Error("Nagad Transaction ID must be exactly 8 characters");
+        }
+
+        // Validate Bangladesh mobile number
+        if (!/^01[3-9]\d{8}$/.test(senderNumber)) {
+          throw new Error("Invalid Bangladesh mobile number");
+        }
+      }
+
+      // Bank validation
+      if (advancePayment.method === "Bank") {
+        const senderBankName = String(
+          advancePayment.senderBankName || "",
+        ).trim();
+
+        const senderBankAccount = String(
+          advancePayment.senderBankAccount || "",
+        ).trim();
+
+        if (!senderBankName || !senderBankAccount) {
+          throw new Error("Bank payment information is incomplete");
+        }
+      }
+    } else if (customer.payment === "COD") {
+      if (advancePayment) {
+        throw new Error("COD orders cannot contain advance payment details");
+      }
+    } else {
+      throw new Error("Invalid payment method");
+    }
+
+    // ===============================
+    // CALCULATE ADVANCE & DUE
+    // ===============================
+    const advanceAmount =
+      customer.payment === "Advance" ? Number(advancePayment.amount) : 0;
+
+    const dueAmount = total - advanceAmount;
+
+    // ===============================
+    // GENERATE ORDER ID
+    // ===============================
     const orderId = `MCA-2027-${Date.now().toString().slice(-6)}`;
 
+    // ===============================
+    // COMPLETE ORDER OBJECT
+    // ===============================
     const order = {
       orderId,
 
       customer: {
         name: String(customer.name).trim(),
         phone,
-        division: String(customer.division || "").trim(),
+        division: String(customer.division).trim(),
         district: String(customer.district).trim(),
         upazila: String(customer.upazila).trim(),
         address: String(customer.address).trim(),
-        payment: customer.payment === "Advance" ? "Advance" : "COD",
+        payment: customer.payment,
       },
 
+      // IMPORTANT: Apps Script needs this products array
       products: verifiedProducts,
+
+      advancePayment:
+        customer.payment === "Advance"
+          ? {
+              ...advancePayment,
+              amount: advanceAmount,
+            }
+          : null,
+
       subtotal,
       delivery,
       total,
+
+      advanceAmount,
+      dueAmount,
+
       status: "Pending",
       createdAt: new Date().toISOString(),
     };
 
-    // 1. Save order in Google Sheets
+    // console.log("✅ Final Order Data:", order);
+
+    // ===============================
+    // SAVE ORDER TO GOOGLE SHEETS
+    // ===============================
     await saveToGoogleSheet(order);
 
-    // 2. Prepare Telegram message
+    // ===============================
+    // TELEGRAM PRODUCT DETAILS
+    // ===============================
     const productText = verifiedProducts
       .map(
         (item) =>
@@ -400,6 +502,36 @@ app.post("/api/orders", async (req, res) => {
       )
       .join("\n");
 
+    // ===============================
+    // TELEGRAM PAYMENT DETAILS
+    // ===============================
+    let advancePaymentText = "";
+
+    if (order.customer.payment === "Advance") {
+      if (order.advancePayment.method === "Nagad") {
+        advancePaymentText = `
+💳 Advance Method: Nagad
+🧾 Transaction ID: ${order.advancePayment.transactionId}
+📱 Sender Number: ${order.advancePayment.senderNumber}
+💰 Advance Amount: ৳${advanceAmount}
+`;
+      } else if (order.advancePayment.method === "Bank") {
+        advancePaymentText = `
+💳 Advance Method: Bank
+🏦 Sender Bank: ${order.advancePayment.senderBankName}
+🔢 Sender Account: ${order.advancePayment.senderBankAccount}
+💰 Advance Amount: ৳${advanceAmount}
+`;
+      }
+    } else {
+      advancePaymentText = `
+💳 Payment Method: Cash on Delivery
+`;
+    }
+
+    // ===============================
+    // TELEGRAM MESSAGE
+    // ===============================
     const message = `
 🛒 NEW ORDER - MERIT CARE
 
@@ -419,18 +551,31 @@ ${productText}
 🚚 Delivery: ৳${delivery}
 💵 Total: ৳${total}
 
-💳 Payment: ${order.customer.payment}
+💳 Advance Paid: ৳${advanceAmount}
+⏳ Due Amount: ৳${dueAmount}
+
+${advancePaymentText}
+
 📌 Status: Pending
 `;
 
-    // 3. Send Telegram notification
+    // ===============================
+    // SEND TELEGRAM MESSAGE
+    // ===============================
     await sendTelegramMessage(message, order.orderId);
 
+    // ===============================
+    // SUCCESS RESPONSE
+    // ===============================
     return res.status(201).json({
       success: true,
       message: "Order placed successfully",
       orderId,
+      subtotal,
+      delivery,
       total,
+      advanceAmount,
+      dueAmount,
     });
   } catch (error) {
     console.error("❌ Order Error:", {
@@ -442,7 +587,10 @@ ${productText}
 
     return res.status(500).json({
       success: false,
-      message: error.message || "Order could not be completed.",
+      message:
+        error.response?.data?.message ||
+        error.message ||
+        "Order could not be completed.",
     });
   }
 });
